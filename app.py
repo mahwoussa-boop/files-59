@@ -48,6 +48,13 @@ st.markdown(
         padding: 12px 16px;
         border-left: 4px solid #ffa000;
     }
+    .panel-card {
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        padding: 14px 16px;
+        box-shadow: 0 1px 2px rgba(0,0,0,.04);
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -55,6 +62,7 @@ st.markdown(
 
 SELECTION_MODES = {
     "كلمات / Words": "word",
+    "أسطر / Lines": "line",
     "عناصر نصية كاملة / Full Text Elements": "span",
 }
 
@@ -96,6 +104,20 @@ def refresh_elements(reset_selection: bool = False):
         st.session_state["selected_idx"] = 0
 
 
+def _selected_rows_from_event(event) -> list[int]:
+    if event is None:
+        return []
+    selection = getattr(event, "selection", None)
+    if selection is None and isinstance(event, dict):
+        selection = event.get("selection")
+    if selection is None:
+        return []
+    if isinstance(selection, dict):
+        return list(selection.get("rows", []) or [])
+    rows = getattr(selection, "rows", None)
+    return list(rows or [])
+
+
 with st.sidebar:
     st.title("📄 محرر PDF الذكي")
     st.caption("Smart PDF Text Replacement")
@@ -104,7 +126,7 @@ with st.sidebar:
     uploaded = st.file_uploader(
         "ارفع ملف PDF / Upload PDF",
         type=["pdf"],
-        help="يدعم ملفات PDF النصية ويستطيع استخدام OCR للصفحات الصورية عند التفعيل.",
+        help="يدعم ملفات PDF النصية ويمكنه التعامل مع الصفحات الصورية باستخدام OCR عند التفعيل.",
     )
 
     if uploaded is not None:
@@ -140,6 +162,7 @@ with st.sidebar:
             "طريقة الاختيار / Selection Mode",
             options=list(SELECTION_MODES.keys()),
             index=list(SELECTION_MODES.values()).index(st.session_state["selection_mode"]),
+            help="اختر بين تحرير كلمة مفردة أو سطر كامل أو عنصر نصي كامل حسب الحاجة.",
         )
         mode_value = SELECTION_MODES[mode_label]
         if mode_value != st.session_state["selection_mode"]:
@@ -156,6 +179,13 @@ with st.sidebar:
             st.session_state["use_ocr_fallback"] = use_ocr
             st.session_state["smart_matches"] = []
             refresh_elements(reset_selection=True)
+
+        if st.session_state["use_ocr_fallback"]:
+            ocr_status = editor.get_ocr_status(force_check=True)
+            if ocr_status["available"]:
+                st.caption(f"OCR: {ocr_status['message']}")
+            else:
+                st.warning(f"OCR غير متاح حاليًا: {ocr_status['message']}")
 
         use_ai = st.checkbox(
             "مساعدة ذكية اختيارية للعثور على أقرب تطابق",
@@ -285,11 +315,15 @@ with preview_col:
             """
             <div class="warning-card">
             ⚠️ <strong>تنبيه:</strong> لم يتم العثور على نصوص أصلية قابلة للتحرير في هذا الوضع.
-            إذا كانت الصفحة صورة، فعّل OCR من الشريط الجانبي ليحاول التطبيق استخراج الكلمات تلقائيًا.
+            إذا كانت الصفحة صورة، فعّل OCR من الشريط الجانبي ليحاول التطبيق استخراج الكلمات أو الأسطر تلقائيًا.
             </div>
             """,
             unsafe_allow_html=True,
         )
+        if use_ocr_fallback:
+            ocr_status = editor.get_ocr_status()
+            if not ocr_status["available"]:
+                st.caption(f"حالة OCR الحالية: {ocr_status['message']}")
 
     png_bytes = editor.render_page(page_num, zoom=1.8)
     if png_bytes:
@@ -297,127 +331,153 @@ with preview_col:
 
     if elements:
         st.subheader("📃 العناصر القابلة للتحرير / Editable Items")
+        st.caption("يمكنك الضغط على أي صف في الجدول لفتح العنصر نفسه في نافذة التحرير على اليمين.")
         df = elements_to_dataframe(elements)
-        st.dataframe(
-            df,
-            use_container_width=True,
-            height=320,
-            hide_index=True,
-            column_config={
+        dataframe_kwargs = {
+            "data": df,
+            "use_container_width": True,
+            "height": 320,
+            "hide_index": True,
+            "column_config": {
                 "#": st.column_config.NumberColumn(width="small"),
                 "النص / Text": st.column_config.TextColumn(width="large"),
                 "النوع / Type": st.column_config.TextColumn(width="small"),
                 "المصدر / Source": st.column_config.TextColumn(width="small"),
                 "اللون / Color": st.column_config.TextColumn(width="small"),
             },
-        )
+        }
+
+        selected_rows = []
+        try:
+            event = st.dataframe(
+                **dataframe_kwargs,
+                on_select="rerun",
+                selection_mode="single-row",
+            )
+            selected_rows = _selected_rows_from_event(event)
+        except TypeError:
+            st.dataframe(**dataframe_kwargs)
+
+        if selected_rows:
+            selected_from_table = int(df.iloc[selected_rows[0]]["#"])
+            if selected_from_table != st.session_state["selected_idx"]:
+                st.session_state["selected_idx"] = selected_from_table
+                st.rerun()
 
 with edit_col:
-    st.subheader("✏️ التحرير اليدوي / Manual Edit")
+    st.subheader("✏️ نافذة تحرير العنصر المحدد / Edit Window")
 
     if not elements:
         st.info("لا توجد عناصر قابلة للتحرير حاليًا. جرّب تفعيل OCR أو استخدم الاستبدال الذكي بعد تغيير الإعدادات.")
     else:
-        idx_options = list(range(len(elements)))
-        default_index = min(st.session_state.get("selected_idx", 0), len(idx_options) - 1)
-        selected_idx = st.selectbox(
-            "اختر عنصرًا للتعديل اليدوي",
-            options=idx_options,
-            index=default_index,
-            format_func=lambda i: f"[{i}] {elements[i].text[:60]}{'…' if len(elements[i].text) > 60 else ''}",
-        )
-        st.session_state["selected_idx"] = selected_idx
-        elem: TextElement = elements[selected_idx]
-        flags = decode_font_flags(elem.flags)
-        is_arabic = contains_arabic(elem.text)
-
-        st.markdown(
-            f"""
-            <div class="info-card">
-            <strong>العنصر #{elem.index}</strong> &nbsp;|&nbsp;
-            المصدر: <code>{elem.source}</code> &nbsp;|&nbsp;
-            النوع: <code>{elem.kind}</code> &nbsp;|&nbsp;
-            الخط: <code>{elem.font_name}</code> &nbsp;|&nbsp;
-            الحجم: <code>{elem.font_size}pt</code> &nbsp;|&nbsp;
-            اللون: <code>{rgb_to_hex(*elem.color)}</code><br>
-            الاتجاه: {'RTL ←' if is_arabic else 'LTR →'}
-            {'&nbsp;| <strong>Bold</strong>' if flags['bold'] else ''}
-            {'&nbsp;| <em>Italic</em>' if flags['italic'] else ''}
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        st.text_area(
-            "النص الأصلي / Original Text",
-            value=elem.text,
-            height=80,
-            disabled=True,
-        )
-        new_text = st.text_area(
-            "النص الجديد / New Text",
-            value=elem.text,
-            height=90,
-            key=f"manual_new_{selected_idx}_{selection_mode}",
-        )
-
-        with st.expander("⚙️ خيارات متقدمة / Advanced Options"):
-            col_a, col_b = st.columns(2)
-            with col_a:
-                custom_size = st.number_input(
-                    "حجم الخط / Font Size (pt)",
-                    min_value=4.0,
-                    max_value=200.0,
-                    value=float(elem.font_size),
-                    step=0.5,
-                    key=f"size_{selected_idx}_{selection_mode}",
+        with st.container(border=True):
+            nav_col1, nav_col2 = st.columns([1, 1])
+            with nav_col1:
+                idx_options = list(range(len(elements)))
+                default_index = min(st.session_state.get("selected_idx", 0), len(idx_options) - 1)
+                selected_idx = st.selectbox(
+                    "اختر عنصرًا للتعديل اليدوي",
+                    options=idx_options,
+                    index=default_index,
+                    format_func=lambda i: f"[{i}] {elements[i].text[:60]}{'…' if len(elements[i].text) > 60 else ''}",
                 )
-                auto_fit = st.checkbox(
-                    "تصغير تلقائي / Auto-fit",
-                    value=True,
-                    key=f"autofit_{selected_idx}_{selection_mode}",
-                )
-            with col_b:
-                color_hex = st.color_picker(
-                    "اللون / Color",
-                    value=rgb_to_hex(*elem.color),
-                    key=f"color_{selected_idx}_{selection_mode}",
-                )
+                st.session_state["selected_idx"] = selected_idx
+            with nav_col2:
+                st.caption("لتحرير أشمل وبنفس السطر، اختر وضع الأسطر من الشريط الجانبي عند الحاجة.")
 
-        if new_text != elem.text:
+            elem: TextElement = elements[selected_idx]
+            flags = decode_font_flags(elem.flags)
+            is_arabic = contains_arabic(elem.text)
+
             st.markdown(
-                f'<div class="info-card">🔍 الفرق / Diff: {simple_diff(elem.text, new_text)}</div>',
+                f"""
+                <div class="info-card">
+                <strong>العنصر #{elem.index}</strong> &nbsp;|&nbsp;
+                المصدر: <code>{elem.source}</code> &nbsp;|&nbsp;
+                النوع: <code>{elem.kind}</code> &nbsp;|&nbsp;
+                الخط: <code>{elem.font_name}</code> &nbsp;|&nbsp;
+                الحجم: <code>{elem.font_size}pt</code> &nbsp;|&nbsp;
+                اللون: <code>{rgb_to_hex(*elem.color)}</code><br>
+                الاتجاه: {'RTL ←' if is_arabic else 'LTR →'}
+                {'&nbsp;| <strong>Bold</strong>' if flags['bold'] else ''}
+                {'&nbsp;| <em>Italic</em>' if flags['italic'] else ''}
+                </div>
+                """,
                 unsafe_allow_html=True,
             )
 
-        if st.button("✅ تطبيق التعديل اليدوي", use_container_width=True):
-            elem.color = hex_to_rgb(color_hex)
-            size_override = None if auto_fit else custom_size
-            result = editor.replace_text(
-                page_num=page_num,
-                element=elem,
-                new_text=new_text,
-                font_size_override=size_override,
-                auto_fit=auto_fit,
+            st.text_area(
+                "النص الأصلي / Original Text",
+                value=elem.text,
+                height=80,
+                disabled=True,
             )
-            if result["success"]:
-                refresh_elements(reset_selection=True)
-                st.session_state["edit_results"].append(result)
-                st.success("تم حفظ التعديل اليدوي بنجاح.")
-                st.rerun()
-            else:
-                st.error(f"❌ فشل التعديل: {result['message']}")
+            new_text = st.text_area(
+                "النص الجديد / New Text",
+                value=elem.text,
+                height=90,
+                key=f"manual_new_{selected_idx}_{selection_mode}",
+                help="سيتم مسح النص السابق واستبداله في الموضع نفسه قدر الإمكان مع الحفاظ على السطر واللون والحجم والخط القريب.",
+            )
 
-        recent = st.session_state.get("edit_results", [])
-        if recent:
-            with st.expander(f"📊 آخر النتائج ({len(recent)})"):
-                for i, result in enumerate(reversed(recent[-5:]), 1):
-                    st.caption(
-                        f"{i}. {result.get('message', '')} | "
-                        f"{result.get('matched_text', result.get('element_kind', '—'))}"
+            with st.expander("⚙️ خيارات متقدمة / Advanced Options"):
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    custom_size = st.number_input(
+                        "حجم الخط / Font Size (pt)",
+                        min_value=4.0,
+                        max_value=200.0,
+                        value=float(elem.font_size),
+                        step=0.5,
+                        key=f"size_{selected_idx}_{selection_mode}",
                     )
+                    auto_fit = st.checkbox(
+                        "تصغير تلقائي / Auto-fit",
+                        value=True,
+                        key=f"autofit_{selected_idx}_{selection_mode}",
+                        help="يحافظ على بقاء النص داخل نفس الصندوق والموضع عند زيادة طول النص الجديد.",
+                    )
+                with col_b:
+                    color_hex = st.color_picker(
+                        "اللون / Color",
+                        value=rgb_to_hex(*elem.color),
+                        key=f"color_{selected_idx}_{selection_mode}",
+                    )
+
+            if new_text != elem.text:
+                st.markdown(
+                    f'<div class="info-card">🔍 الفرق / Diff: {simple_diff(elem.text, new_text)}</div>',
+                    unsafe_allow_html=True,
+                )
+
+            if st.button("✅ تطبيق التعديل اليدوي", use_container_width=True):
+                elem.color = hex_to_rgb(color_hex)
+                size_override = None if auto_fit else custom_size
+                result = editor.replace_text(
+                    page_num=page_num,
+                    element=elem,
+                    new_text=new_text,
+                    font_size_override=size_override,
+                    auto_fit=auto_fit,
+                )
+                if result["success"]:
+                    refresh_elements(reset_selection=True)
+                    st.session_state["edit_results"].append(result)
+                    st.success("تم حفظ التعديل اليدوي بنجاح.")
+                    st.rerun()
+                else:
+                    st.error(f"❌ فشل التعديل: {result['message']}")
+
+            recent = st.session_state.get("edit_results", [])
+            if recent:
+                with st.expander(f"📊 آخر النتائج ({len(recent)})"):
+                    for i, result in enumerate(reversed(recent[-5:]), 1):
+                        st.caption(
+                            f"{i}. {result.get('message', '')} | "
+                            f"{result.get('matched_text', result.get('element_kind', '—'))}"
+                        )
 
 st.divider()
 st.caption(
-    "⚡ المحرر الذكي يدعم الآن البحث عن الكلمة واستبدالها، وOCR الاحتياطي، ومساعدة ذكية اختيارية لأقرب تطابق."
+    "⚡ المحرر الذكي يدعم الآن اختيار الكلمات أو الأسطر، وOCR الاحتياطي الآمن، والاستبدال داخل نفس الموضع بأعلى دقة ممكنة دون إعادة بناء المشروع من الصفر."
 )

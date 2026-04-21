@@ -4,7 +4,15 @@ Professional Streamlit PDF Text Editor.
 Supports Arabic & English, smart search-and-replace, OCR fallback, and manual editing.
 """
 
+from io import BytesIO
+
 import streamlit as st
+from PIL import Image
+
+try:
+    from streamlit_image_coordinates import streamlit_image_coordinates
+except Exception:  # pragma: no cover - optional at runtime until environment installs it
+    streamlit_image_coordinates = None
 
 from pdf_editor import PDFEditor, TextElement
 from utils import (
@@ -79,6 +87,8 @@ def _init_state():
         "use_ocr_fallback": True,
         "use_ai_assist": False,
         "smart_matches": [],
+        "last_preview_click_ts": 0,
+        "preview_selection_info": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -118,6 +128,78 @@ def _selected_rows_from_event(event) -> list[int]:
     return list(rows or [])
 
 
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(value, high))
+
+
+def _process_preview_selection(event_value, image_width: int, image_height: int):
+    if not event_value or not isinstance(event_value, dict):
+        return
+
+    unix_time = int(event_value.get("unix_time") or 0)
+    if unix_time and unix_time == st.session_state.get("last_preview_click_ts", 0):
+        return
+    if unix_time:
+        st.session_state["last_preview_click_ts"] = unix_time
+
+    page_num = st.session_state["page_num"]
+    mode = st.session_state["selection_mode"]
+    use_ocr = st.session_state["use_ocr_fallback"]
+    page_width, page_height = editor.get_page_size(page_num)
+    if page_width <= 0 or page_height <= 0:
+        return
+
+    display_width = max(float(event_value.get("width") or image_width), 1.0)
+    display_height = max(float(event_value.get("height") or image_height), 1.0)
+    scale_x = image_width / display_width
+    scale_y = image_height / display_height
+    pdf_scale_x = page_width / max(image_width, 1)
+    pdf_scale_y = page_height / max(image_height, 1)
+
+    if all(key in event_value for key in ("x1", "y1", "x2", "y2")):
+        ix0 = _clamp(float(event_value["x1"]) * scale_x, 0.0, float(image_width))
+        iy0 = _clamp(float(event_value["y1"]) * scale_y, 0.0, float(image_height))
+        ix1 = _clamp(float(event_value["x2"]) * scale_x, 0.0, float(image_width))
+        iy1 = _clamp(float(event_value["y2"]) * scale_y, 0.0, float(image_height))
+        selected = editor.select_element_by_region(
+            page_num=page_num,
+            x0=ix0 * pdf_scale_x,
+            y0=iy0 * pdf_scale_y,
+            x1=ix1 * pdf_scale_x,
+            y1=iy1 * pdf_scale_y,
+            mode=mode,
+            use_ocr_fallback=use_ocr,
+        )
+    elif all(key in event_value for key in ("x", "y")):
+        ix = _clamp(float(event_value["x"]) * scale_x, 0.0, float(image_width))
+        iy = _clamp(float(event_value["y"]) * scale_y, 0.0, float(image_height))
+        selected = editor.select_element_by_point(
+            page_num=page_num,
+            x=ix * pdf_scale_x,
+            y=iy * pdf_scale_y,
+            mode=mode,
+            use_ocr_fallback=use_ocr,
+        )
+    else:
+        return
+
+    if selected is None:
+        st.session_state["preview_selection_info"] = {
+            "status": "miss",
+            "message": "لم يتم العثور على عنصر نصي قريب من هذا الموضع.",
+        }
+        return
+
+    st.session_state["selected_idx"] = int(selected.index)
+    st.session_state["preview_selection_info"] = {
+        "status": "selected",
+        "message": f"تم تحديد: {selected.text}",
+        "kind": selected.kind,
+        "source": selected.source,
+    }
+    st.rerun()
+
+
 with st.sidebar:
     st.title("📄 محرر PDF الذكي")
     st.caption("Smart PDF Text Replacement")
@@ -141,6 +223,8 @@ with st.sidebar:
             st.session_state["selected_idx"] = 0
             st.session_state["edit_results"] = []
             st.session_state["smart_matches"] = []
+            st.session_state["last_preview_click_ts"] = 0
+            st.session_state["preview_selection_info"] = None
             refresh_elements(reset_selection=True)
             st.success(f"✅ تم رفع الملف: {uploaded.name}")
 
@@ -156,6 +240,8 @@ with st.sidebar:
         if page_num != st.session_state["page_num"]:
             st.session_state["page_num"] = page_num
             st.session_state["smart_matches"] = []
+            st.session_state["last_preview_click_ts"] = 0
+            st.session_state["preview_selection_info"] = None
             refresh_elements(reset_selection=True)
 
         mode_label = st.radio(
@@ -168,6 +254,8 @@ with st.sidebar:
         if mode_value != st.session_state["selection_mode"]:
             st.session_state["selection_mode"] = mode_value
             st.session_state["smart_matches"] = []
+            st.session_state["last_preview_click_ts"] = 0
+            st.session_state["preview_selection_info"] = None
             refresh_elements(reset_selection=True)
 
         use_ocr = st.checkbox(
@@ -178,6 +266,8 @@ with st.sidebar:
         if use_ocr != st.session_state["use_ocr_fallback"]:
             st.session_state["use_ocr_fallback"] = use_ocr
             st.session_state["smart_matches"] = []
+            st.session_state["last_preview_click_ts"] = 0
+            st.session_state["preview_selection_info"] = None
             refresh_elements(reset_selection=True)
 
         if st.session_state["use_ocr_fallback"]:
@@ -325,9 +415,33 @@ with preview_col:
             if not ocr_status["available"]:
                 st.caption(f"حالة OCR الحالية: {ocr_status['message']}")
 
-    png_bytes = editor.render_page(page_num, zoom=1.8)
+    preview_zoom = 2.1
+    png_bytes = editor.render_page(page_num, zoom=preview_zoom)
     if png_bytes:
-        st.image(png_bytes, use_container_width=True)
+        preview_image = Image.open(BytesIO(png_bytes)).convert("RGB")
+        image_width, image_height = preview_image.size
+        if streamlit_image_coordinates is not None:
+            st.caption("اضغط أو اسحب بالماوس فوق الكلمة أو السطر في المعاينة ليتم تحديده مباشرة في نافذة التحرير.")
+            preview_event = streamlit_image_coordinates(
+                preview_image,
+                key=f"preview_click_{page_num}_{selection_mode}_{int(use_ocr_fallback)}",
+                use_column_width="auto",
+                click_and_drag=True,
+                cursor="crosshair",
+            )
+            _process_preview_selection(preview_event, image_width=image_width, image_height=image_height)
+        else:
+            st.image(png_bytes, use_container_width=True)
+            st.warning("مكوّن التحديد المباشر غير متاح في البيئة الحالية، لذلك تم عرض المعاينة العادية فقط.")
+
+        preview_info = st.session_state.get("preview_selection_info")
+        if preview_info:
+            if preview_info.get("status") == "selected":
+                st.caption(
+                    f"{preview_info.get('message', '')} — {preview_info.get('source', '—')}/{preview_info.get('kind', '—')}"
+                )
+            else:
+                st.caption(preview_info.get("message", ""))
 
     if elements:
         st.subheader("📃 العناصر القابلة للتحرير / Editable Items")

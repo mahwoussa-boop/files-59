@@ -115,6 +115,12 @@ class PDFEditor:
     def page_count(self) -> int:
         return len(self.doc) if self.doc else 0
 
+    def get_page_size(self, page_num: int) -> tuple[float, float]:
+        if not self.doc or page_num >= len(self.doc):
+            return (0.0, 0.0)
+        rect = self.doc[page_num].rect
+        return (float(rect.width), float(rect.height))
+
     def get_ocr_status(self, force_check: bool = False) -> dict:
         if force_check:
             self._ensure_ocr_engine()
@@ -144,6 +150,98 @@ class PDFEditor:
         if not elements and use_ocr_fallback:
             elements = self._extract_ocr_elements(page_num, mode=mode)
         return elements
+
+    def select_element_by_point(
+        self,
+        page_num: int,
+        x: float,
+        y: float,
+        mode: str = "word",
+        use_ocr_fallback: bool = False,
+        tolerance: float = 12.0,
+    ) -> Optional[TextElement]:
+        elements = self.extract_text_elements(page_num, mode=mode, use_ocr_fallback=use_ocr_fallback)
+        if not elements:
+            return None
+
+        point = fitz.Point(x, y)
+        containing = []
+        nearby = []
+        for element in elements:
+            rect = self._hit_test_rect(element, tolerance=tolerance)
+            center_x = (element.x0 + element.x1) / 2.0
+            center_y = (element.y0 + element.y1) / 2.0
+            center_distance = ((center_x - x) ** 2 + (center_y - y) ** 2) ** 0.5
+            area = max(element.width * element.height, 1.0)
+            if rect.contains(point):
+                containing.append((area, center_distance, element))
+                continue
+
+            dx = 0.0 if rect.x0 <= x <= rect.x1 else min(abs(x - rect.x0), abs(x - rect.x1))
+            dy = 0.0 if rect.y0 <= y <= rect.y1 else min(abs(y - rect.y0), abs(y - rect.y1))
+            edge_distance = (dx ** 2 + dy ** 2) ** 0.5
+            nearby.append((edge_distance, area, center_distance, element))
+
+        if containing:
+            containing.sort(key=lambda item: (item[0], item[1]))
+            return containing[0][2]
+
+        nearby.sort(key=lambda item: (item[0], item[1], item[2]))
+        if nearby and nearby[0][0] <= max(tolerance, 4.0):
+            return nearby[0][3]
+        return None
+
+    def select_element_by_region(
+        self,
+        page_num: int,
+        x0: float,
+        y0: float,
+        x1: float,
+        y1: float,
+        mode: str = "word",
+        use_ocr_fallback: bool = False,
+        tolerance: float = 8.0,
+    ) -> Optional[TextElement]:
+        elements = self.extract_text_elements(page_num, mode=mode, use_ocr_fallback=use_ocr_fallback)
+        if not elements:
+            return None
+
+        region = fitz.Rect(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+        if region.width <= 2 and region.height <= 2:
+            return self.select_element_by_point(
+                page_num=page_num,
+                x=region.x0,
+                y=region.y0,
+                mode=mode,
+                use_ocr_fallback=use_ocr_fallback,
+                tolerance=max(tolerance, 12.0),
+            )
+
+        matches = []
+        for element in elements:
+            rect = self._hit_test_rect(element, tolerance=tolerance)
+            inter = rect & region
+            if inter.is_empty:
+                continue
+            overlap_area = inter.get_area()
+            overlap_ratio = overlap_area / max(min(rect.get_area(), region.get_area()), 1.0)
+            center_x = (element.x0 + element.x1) / 2.0
+            center_y = (element.y0 + element.y1) / 2.0
+            center_distance = ((center_x - region.tl.x - region.width / 2.0) ** 2 + (center_y - region.tl.y - region.height / 2.0) ** 2) ** 0.5
+            matches.append((-overlap_ratio, center_distance, max(element.width * element.height, 1.0), element))
+
+        if matches:
+            matches.sort(key=lambda item: (item[0], item[1], item[2]))
+            return matches[0][3]
+
+        return self.select_element_by_point(
+            page_num=page_num,
+            x=region.tl.x + region.width / 2.0,
+            y=region.tl.y + region.height / 2.0,
+            mode=mode,
+            use_ocr_fallback=use_ocr_fallback,
+            tolerance=max(region.width, region.height, tolerance),
+        )
 
     def _extract_span_elements(self, page_num: int) -> list[TextElement]:
         page = self.doc[page_num]
@@ -619,10 +717,18 @@ class PDFEditor:
 
         page = self.doc[page_num]
         rect = fitz.Rect(element.x0, element.y0, element.x1, element.y1)
-        bg_color = _detect_background(page, rect)
+        expand_x = max(min(element.width * 0.08, 3.0), 1.0)
+        expand_y = max(min(element.height * 0.18, 3.0), 1.0)
+        safe_rect = fitz.Rect(
+            max(page.rect.x0, rect.x0 - expand_x),
+            max(page.rect.y0, rect.y0 - expand_y),
+            min(page.rect.x1, rect.x1 + expand_x),
+            min(page.rect.y1, rect.y1 + expand_y),
+        )
+        bg_color = _detect_background(page, safe_rect)
 
         try:
-            self._erase_previous_content(page, rect, bg_color, element.source)
+            self._erase_previous_content(page, safe_rect, bg_color, element.source)
 
             last_exc = None
             for font_plan in self._font_candidates(element, new_text):
@@ -633,11 +739,11 @@ class PDFEditor:
                             new_text,
                             font_plan,
                             element.font_size,
-                            max(element.width, 5),
-                            max(element.height, 5),
+                            max(safe_rect.width, 5),
+                            max(safe_rect.height, 5),
                         )
 
-                    insert_point = self._compute_insert_point(rect, element, new_text, font_plan, font_size)
+                    insert_point = self._compute_insert_point(safe_rect, element, new_text, font_plan, font_size)
                     self._insert_text(page, insert_point, new_text, font_plan, font_size, element.color)
                     return {
                         "success": True,
@@ -748,17 +854,20 @@ class PDFEditor:
     ) -> fitz.Point:
         direction = detect_text_direction(text or element.text)
         text_width = self._measure_text_width(text, font_plan, font_size)
+        horizontal_padding = min(max(font_size * 0.08, 0.5), max(rect.width / 6.0, 0.5))
 
         if direction == "rtl":
-            x = rect.x1 - text_width
+            x = rect.x1 - text_width - horizontal_padding
         else:
-            x = rect.x0
+            x = rect.x0 + horizontal_padding
 
-        x = max(rect.x0, min(x, rect.x1 - max(text_width, 0.0)))
+        min_x = rect.x0 + min(horizontal_padding, rect.width / 4.0)
+        max_x = max(min_x, rect.x1 - max(text_width, 0.0) - min(horizontal_padding, rect.width / 4.0))
+        x = max(min_x, min(x, max_x))
 
         baseline_y = element.origin[1] if element.origin and len(element.origin) > 1 else rect.y1
-        min_baseline = rect.y0 + max(font_size * 0.8, 1.0)
-        max_baseline = max(rect.y1 - 1.0, min_baseline)
+        min_baseline = rect.y0 + max(font_size * 0.92, 1.0)
+        max_baseline = max(min_baseline, rect.y1 - max(font_size * 0.08, 0.8))
         baseline_y = max(min_baseline, min(baseline_y, max_baseline))
         return fitz.Point(x, baseline_y)
 
@@ -834,12 +943,14 @@ class PDFEditor:
         return best_match
 
     def _fit_font_size(self, text: str, font_plan: dict, original_size: float, max_width: float, max_height: float) -> float:
-        size = min(original_size, max(max_height * 0.95, 4.0))
+        width_limit = max(max_width - 1.0, 1.0)
+        height_limit = max(max_height * 0.84, 4.0)
+        size = min(original_size, height_limit)
         while size >= 4.0:
             text_width = self._measure_text_width(text, font_plan, size)
-            if text_width <= max_width:
+            if text_width <= width_limit and size <= height_limit:
                 break
-            size -= 0.5
+            size -= 0.25
         return max(size, 4.0)
 
     def _measure_text_width(self, text: str, font_plan: dict, fontsize: float) -> float:
@@ -854,6 +965,11 @@ class PDFEditor:
             return float(fitz.get_text_length(text, fontname=font_plan["fontname"], fontsize=fontsize))
         except Exception:
             return max(len(text), 1) * max(fontsize, 1.0) * 0.55
+
+    def _hit_test_rect(self, element: TextElement, tolerance: float = 8.0) -> fitz.Rect:
+        pad_x = max(tolerance * 0.35, min(element.width * 0.18, 10.0), 2.0)
+        pad_y = max(tolerance * 0.35, min(element.height * 0.35, 8.0), 2.0)
+        return fitz.Rect(element.x0 - pad_x, element.y0 - pad_y, element.x1 + pad_x, element.y1 + pad_y)
 
 
 # ------------------------------------------------------------------ #

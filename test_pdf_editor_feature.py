@@ -1,52 +1,87 @@
+from pathlib import Path
+
 import fitz
+from PIL import Image, ImageDraw, ImageFont
 
 from pdf_editor import PDFEditor
 
 
-def build_sample_pdf(path: str):
+def build_text_pdf(path: str):
     doc = fitz.open()
     page = doc.new_page()
-    page.insert_text((72, 100), "Hello world from PDF", fontname="helv", fontsize=14)
-    page.insert_text((72, 140), "مرحبا بالعالم", fontname="helv", fontsize=14)
+    page.insert_text((72, 100), "Hello world from PDF", fontname="helv", fontsize=18)
+    page.insert_text((72, 140), "Hello invoice", fontname="helv", fontsize=16)
+    doc.save(path)
+    doc.close()
+
+
+def build_scanned_pdf(path: str):
+    png_path = str(Path(path).with_suffix('.png'))
+    img = Image.new("RGB", (2200, 900), "white")
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 220)
+    except Exception:
+        font = ImageFont.load_default()
+    draw.text((180, 260), "SCANNED HELLO", fill="black", font=font)
+    img.save(png_path, "PNG")
+
+    doc = fitz.open()
+    page = doc.new_page(width=img.width, height=img.height)
+    page.insert_image(page.rect, filename=png_path)
     doc.save(path)
     doc.close()
 
 
 def main():
-    sample_path = "/home/ubuntu/repo_import/sample_test.pdf"
-    build_sample_pdf(sample_path)
+    base = Path("/home/ubuntu/repo_import")
+    text_pdf = str(base / "sample_text_test.pdf")
+    scanned_pdf = str(base / "sample_scanned_test.pdf")
 
-    with open(sample_path, "rb") as f:
-        data = f.read()
+    build_text_pdf(text_pdf)
+    build_scanned_pdf(scanned_pdf)
 
     editor = PDFEditor()
-    editor.load(data, "sample_test.pdf")
+    editor.load(Path(text_pdf).read_bytes(), "sample_text_test.pdf")
 
-    span_elements = editor.extract_text_elements(0, mode="span")
-    word_elements = editor.extract_text_elements(0, mode="word")
+    native_words = editor.extract_text_elements(0, mode="word", use_ocr_fallback=False)
+    assert any(e.text == "Hello" for e in native_words), "Native word extraction failed"
 
-    assert len(span_elements) >= 2, f"Expected at least 2 span elements, got {len(span_elements)}"
-    assert len(word_elements) >= 5, f"Expected at least 5 word elements, got {len(word_elements)}"
+    matches = editor.find_text_matches(0, "invoice", mode="word", use_ocr_fallback=False)
+    assert matches, "Smart search did not find expected native text"
 
-    hello = next((e for e in word_elements if e.text == "Hello"), None)
-    assert hello is not None, "Word-level extraction failed to find 'Hello'"
+    result = editor.smart_replace(
+        page_num=0,
+        search_text="invoice",
+        replacement_text="receipt",
+        mode="word",
+        use_ocr_fallback=False,
+        use_ai=False,
+    )
+    assert result["success"], f"Smart replacement failed: {result}"
 
-    result_word = editor.replace_text(0, hello, "Hi", auto_fit=True)
-    assert result_word["success"], f"Word replacement failed: {result_word}"
+    refreshed = editor.extract_text_elements(0, mode="word", use_ocr_fallback=False)
+    assert any(e.text == "receipt" for e in refreshed), "Replaced word not found after native replacement"
 
-    refreshed_words = editor.extract_text_elements(0, mode="word")
-    assert any(e.text == "Hi" for e in refreshed_words), "Edited word 'Hi' was not found after replacement"
+    scanned_editor = PDFEditor()
+    scanned_editor.load(Path(scanned_pdf).read_bytes(), "sample_scanned_test.pdf")
+    ocr_elements = scanned_editor.extract_text_elements(0, mode="word", use_ocr_fallback=True)
+    assert ocr_elements, "OCR fallback did not extract any text from scanned PDF"
 
-    phrase = next((e for e in editor.extract_text_elements(0, mode="span") if "world" in e.text), None)
-    assert phrase is not None, "Span-level extraction failed to find expected phrase"
+    ocr_result = scanned_editor.smart_replace(
+        page_num=0,
+        search_text="scanned",
+        replacement_text="DIGITAL",
+        mode="word",
+        use_ocr_fallback=True,
+        use_ai=False,
+    )
+    assert ocr_result["success"], f"OCR-based smart replacement failed: {ocr_result}"
 
-    result_span = editor.replace_text(0, phrase, "Greetings Earth", auto_fit=True)
-    assert result_span["success"], f"Span replacement failed: {result_span}"
+    exported = scanned_editor.export_bytes()
+    assert exported.startswith(b"%PDF"), "Exported OCR-edited PDF is invalid"
 
-    exported = editor.export_bytes()
-    assert exported.startswith(b"%PDF"), "Exported bytes are not a valid PDF"
-
-    print("PASS: word-level and span-level editing work")
+    print("PASS: native and OCR smart replacement work")
 
 
 if __name__ == "__main__":

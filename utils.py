@@ -1,8 +1,9 @@
 """
 utils.py
-Helper utilities: RTL detection, color conversion, DataFrame building, etc.
+Helper utilities for PDF text editing, matching, and UI display.
 """
 
+import re
 import unicodedata
 import pandas as pd
 
@@ -24,6 +25,29 @@ def detect_text_direction(text: str) -> str:
     rtl_count = sum(1 for c in text if unicodedata.bidirectional(c) in ("R", "AL", "AN"))
     ltr_count = sum(1 for c in text if unicodedata.bidirectional(c) in ("L",))
     return "rtl" if rtl_count >= ltr_count else "ltr"
+
+
+def normalize_text(text: str) -> str:
+    """Normalize Arabic and English text for tolerant matching."""
+    if not text:
+        return ""
+
+    text = unicodedata.normalize("NFKC", text)
+    text = text.strip().lower()
+
+    arabic_diacritics = re.compile(
+        r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED]"
+    )
+    text = arabic_diacritics.sub("", text)
+    text = text.replace("ـ", "")
+    text = text.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
+    text = text.replace("ة", "ه")
+    text = text.replace("ى", "ي")
+    text = text.replace("ؤ", "و").replace("ئ", "ي")
+
+    text = re.sub(r"[^\w\s\u0600-\u06FF]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 
 # ------------------------------------------------------------------ #
@@ -58,14 +82,16 @@ def elements_to_dataframe(elements: list) -> pd.DataFrame:
     rows = []
     for element in elements:
         direction = detect_text_direction(element.text)
-        kind_label = "Word" if getattr(element, "kind", "span") == "word" else "Span"
+        kind_value = getattr(element, "kind", "span")
+        source_value = getattr(element, "source", "native")
         rows.append(
             {
                 "#": element.index,
                 "النص / Text": element.text,
-                "النوع / Type": kind_label,
+                "النوع / Type": kind_value,
+                "المصدر / Source": source_value,
                 "الخط / Font": element.font_name,
-                "الحجم / Size": element.font_size,
+                "الحجم / Size": round(float(element.font_size), 2),
                 "اللون / Color": rgb_to_hex(*element.color),
                 "X0": round(element.x0, 1),
                 "Y0": round(element.y0, 1),

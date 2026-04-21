@@ -1,18 +1,18 @@
 """
 pdf_editor.py
 Core PDF editing logic using PyMuPDF (fitz).
-Handles text extraction, property detection, and in-place replacement.
+Supports extraction and replacement at both span level and word level.
 """
 
 import fitz  # PyMuPDF
-import io
 from dataclasses import dataclass, field
 from typing import Optional
 
 
 @dataclass
 class TextElement:
-    """Represents a single text element extracted from a PDF page."""
+    """Represents a single editable text element extracted from a PDF page."""
+
     index: int
     text: str
     page_num: int
@@ -22,12 +22,14 @@ class TextElement:
     y1: float
     font_name: str
     font_size: float
-    color: tuple          # (r, g, b) in 0-1 range
+    color: tuple
     block_no: int
     line_no: int
     span_no: int
-    flags: int = 0        # bold / italic flags
+    flags: int = 0
     origin: tuple = field(default_factory=lambda: (0.0, 0.0))
+    kind: str = "span"
+    word_no: int = -1
 
     @property
     def bbox(self):
@@ -51,38 +53,33 @@ class PDFEditor:
     """
     Handles PDF loading, text extraction, and in-place text replacement.
 
-    Strategy for replacement:
-      1. Draw a white (or background-colored) rectangle over the old text bbox.
-      2. Insert new text at the same position with matched font properties.
-      3. If the embedded font is available in the document, reuse it;
-         otherwise fall back to the closest standard font.
+    The editor supports two selection granularities:
+      1. span: edit the full extracted text span.
+      2. word: edit an individual word with inherited style metadata.
     """
 
-    # Fallback font mapping: partial font-name fragments → standard PDF font
     FONT_FALLBACKS = {
-        "arial":       "Helvetica",
-        "helvetica":   "Helvetica",
-        "times":       "Times-Roman",
-        "courier":     "Courier",
-        "verdana":     "Helvetica",
-        "calibri":     "Helvetica",
-        "georgia":     "Times-Roman",
-        "tahoma":      "Helvetica",
-        "trebuchet":   "Helvetica",
-        "impact":      "Helvetica-Bold",
+        "arial": "Helvetica",
+        "helvetica": "Helvetica",
+        "times": "Times-Roman",
+        "courier": "Courier",
+        "verdana": "Helvetica",
+        "calibri": "Helvetica",
+        "georgia": "Times-Roman",
+        "tahoma": "Helvetica",
+        "trebuchet": "Helvetica",
+        "impact": "Helvetica-Bold",
     }
 
     def __init__(self):
         self.doc: Optional[fitz.Document] = None
         self.original_bytes: bytes = b""
         self.filename: str = ""
-        # Stack of (page_num, edit_description) for undo support
         self._history: list = []
-        # Snapshot of doc bytes before each edit (for undo)
         self._snapshots: list = []
 
     # ------------------------------------------------------------------ #
-    #  Loading
+    # Loading
     # ------------------------------------------------------------------ #
 
     def load(self, pdf_bytes: bytes, filename: str = "document.pdf"):
@@ -101,69 +98,134 @@ class PDFEditor:
         return len(self.doc) if self.doc else 0
 
     # ------------------------------------------------------------------ #
-    #  Text extraction
+    # Text extraction
     # ------------------------------------------------------------------ #
 
-    def extract_text_elements(self, page_num: int) -> list[TextElement]:
-        """
-        Extract all text spans from a page with full property metadata.
-        Returns a flat list of TextElement objects sorted top-to-bottom.
-        """
+    def extract_text_elements(self, page_num: int, mode: str = "span") -> list[TextElement]:
+        """Return editable text elements for the selected page and mode."""
         if not self.doc or page_num >= len(self.doc):
             return []
+        if mode == "word":
+            return self._extract_word_elements(page_num)
+        return self._extract_span_elements(page_num)
 
+    def _extract_span_elements(self, page_num: int) -> list[TextElement]:
+        """Extract text spans with styling metadata."""
         page = self.doc[page_num]
         elements = []
         idx = 0
-
-        # dict mode gives us per-span font details
-        blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
+        blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE).get("blocks", [])
 
         for block in blocks:
-            if block.get("type") != 0:   # 0 = text block
+            if block.get("type") != 0:
                 continue
             b_no = block.get("number", 0)
             for l_no, line in enumerate(block.get("lines", [])):
                 for s_no, span in enumerate(line.get("spans", [])):
-                    raw_text = span.get("text", "").strip()
-                    if not raw_text:
+                    raw_text = span.get("text", "")
+                    if not raw_text or not raw_text.strip():
                         continue
 
-                    bbox = span["bbox"]          # (x0, y0, x1, y1)
+                    bbox = span["bbox"]
                     origin = span.get("origin", (bbox[0], bbox[3]))
-
-                    # Color is stored as packed int in PyMuPDF
                     color_int = span.get("color", 0)
                     color_rgb = _int_to_rgb(color_int)
 
-                    elem = TextElement(
-                        index=idx,
-                        text=raw_text,
-                        page_num=page_num,
-                        x0=bbox[0], y0=bbox[1],
-                        x1=bbox[2], y1=bbox[3],
-                        font_name=span.get("font", "Helvetica"),
-                        font_size=round(span.get("size", 12), 2),
-                        color=color_rgb,
-                        block_no=b_no,
-                        line_no=l_no,
-                        span_no=s_no,
-                        flags=span.get("flags", 0),
-                        origin=origin,
+                    elements.append(
+                        TextElement(
+                            index=idx,
+                            text=raw_text.strip(),
+                            page_num=page_num,
+                            x0=bbox[0],
+                            y0=bbox[1],
+                            x1=bbox[2],
+                            y1=bbox[3],
+                            font_name=span.get("font", "Helvetica"),
+                            font_size=round(span.get("size", 12), 2),
+                            color=color_rgb,
+                            block_no=b_no,
+                            line_no=l_no,
+                            span_no=s_no,
+                            flags=span.get("flags", 0),
+                            origin=origin,
+                            kind="span",
+                            word_no=-1,
+                        )
                     )
-                    elements.append(elem)
                     idx += 1
 
-        # Sort top-to-bottom, left-to-right
         elements.sort(key=lambda e: (round(e.y0, 1), e.x0))
-        # Re-index after sort
         for i, e in enumerate(elements):
             e.index = i
+        return elements
 
+    def _extract_word_elements(self, page_num: int) -> list[TextElement]:
+        """Extract individual words and inherit style metadata from the nearest span."""
+        page = self.doc[page_num]
+        span_elements = self._extract_span_elements(page_num)
+        words = page.get_text("words", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+        elements = []
+
+        for idx, word in enumerate(words):
+            x0, y0, x1, y1, raw_text, block_no, line_no, word_no = word
+            clean_text = (raw_text or "").strip()
+            if not clean_text:
+                continue
+
+            matched = self._match_span_for_word(
+                x0=x0,
+                y0=y0,
+                x1=x1,
+                y1=y1,
+                block_no=block_no,
+                line_no=line_no,
+                spans=span_elements,
+            )
+
+            if matched:
+                font_name = matched.font_name
+                font_size = matched.font_size
+                color = matched.color
+                flags = matched.flags
+                baseline_y = matched.origin[1]
+                span_no = matched.span_no
+            else:
+                font_name = "Helvetica"
+                font_size = max(round(y1 - y0, 2), 8.0)
+                color = (0.0, 0.0, 0.0)
+                flags = 0
+                baseline_y = y1
+                span_no = 0
+
+            elements.append(
+                TextElement(
+                    index=len(elements),
+                    text=clean_text,
+                    page_num=page_num,
+                    x0=x0,
+                    y0=y0,
+                    x1=x1,
+                    y1=y1,
+                    font_name=font_name,
+                    font_size=font_size,
+                    color=color,
+                    block_no=block_no,
+                    line_no=line_no,
+                    span_no=span_no,
+                    flags=flags,
+                    origin=(x0, baseline_y),
+                    kind="word",
+                    word_no=word_no,
+                )
+            )
+
+        elements.sort(key=lambda e: (round(e.y0, 1), e.x0))
+        for i, e in enumerate(elements):
+            e.index = i
         return elements
 
     # ------------------------------------------------------------------ #
-    #  Page rendering (for preview)
+    # Page rendering
     # ------------------------------------------------------------------ #
 
     def render_page(self, page_num: int, zoom: float = 1.5) -> bytes:
@@ -176,7 +238,7 @@ class PDFEditor:
         return pix.tobytes("png")
 
     # ------------------------------------------------------------------ #
-    #  Text replacement
+    # Text replacement
     # ------------------------------------------------------------------ #
 
     def replace_text(
@@ -187,48 +249,42 @@ class PDFEditor:
         font_size_override: Optional[float] = None,
         auto_fit: bool = True,
     ) -> dict:
-        """
-        Replace the text of `element` on the given page.
-
-        Approach:
-          1. Snapshot current state for undo.
-          2. Cover old text with a white (filled) rectangle.
-          3. Insert new text at the same origin with matched properties.
-
-        Returns a result dict with keys: success, message, font_used, font_size_used.
-        """
+        """Replace the selected text element on the given page."""
         if not self.doc:
             return {"success": False, "message": "No document loaded."}
 
-        # -- Snapshot for undo --
+        new_text = new_text.strip()
+        if not new_text:
+            return {"success": False, "message": "New text is empty."}
+
         self._snapshots.append(self.doc.tobytes())
-        self._history.append(f"Page {page_num + 1}: '{element.text}' → '{new_text}'")
+        self._history.append(
+            f"Page {page_num + 1} [{element.kind}]: '{element.text}' → '{new_text}'"
+        )
 
         page = self.doc[page_num]
         rect = fitz.Rect(element.x0, element.y0, element.x1, element.y1)
 
-        # 1. Cover old text
-        # Try to detect background color; default white
         bg_color = _detect_background(page, rect)
         page.draw_rect(rect, color=None, fill=bg_color)
 
-        # 2. Determine font to use
         font_name, font_source = self._resolve_font(element.font_name)
-
-        # 3. Determine font size
         font_size = font_size_override or element.font_size
         if auto_fit and font_size_override is None:
             font_size = self._fit_font_size(
-                new_text, font_name, element.font_size, element.width, element.height
+                text=new_text,
+                font_name=font_name,
+                original_size=element.font_size,
+                max_width=max(element.width, 5),
+                max_height=max(element.height, 5),
             )
 
-        # 4. Insert new text
-        color = element.color  # (r, g, b) in 0-1 range
+        color = element.color
+        insert_point = fitz.Point(element.x0, element.origin[1])
 
         try:
-            # Use insert_text for precise placement
             rc = page.insert_text(
-                fitz.Point(element.x0, element.origin[1]),
+                insert_point,
                 new_text,
                 fontname=font_name,
                 fontsize=font_size,
@@ -236,24 +292,22 @@ class PDFEditor:
                 render_mode=0,
             )
             if rc < 0:
-                # insert_text returns chars written; negative means failure
                 raise RuntimeError("insert_text returned error code")
 
             return {
                 "success": True,
-                "message": f"Text replaced successfully.",
+                "message": "Text replaced successfully.",
                 "font_used": font_name,
                 "font_source": font_source,
                 "font_size_used": font_size,
+                "element_kind": element.kind,
             }
-
-        except Exception as e:
-            # Roll back snapshot on failure
+        except Exception as exc:
             self._undo_internal()
-            return {"success": False, "message": f"Replacement failed: {e}"}
+            return {"success": False, "message": f"Replacement failed: {exc}"}
 
     # ------------------------------------------------------------------ #
-    #  Undo
+    # Undo
     # ------------------------------------------------------------------ #
 
     def undo(self) -> bool:
@@ -274,35 +328,75 @@ class PDFEditor:
         return list(self._history)
 
     # ------------------------------------------------------------------ #
-    #  Export
+    # Export
     # ------------------------------------------------------------------ #
 
     def export_bytes(self) -> bytes:
-        """Return the current document as PDF bytes (deflated)."""
+        """Return the current document as PDF bytes."""
         if not self.doc:
             return b""
         return self.doc.tobytes(deflate=True)
 
     # ------------------------------------------------------------------ #
-    #  Internal helpers
+    # Internal helpers
     # ------------------------------------------------------------------ #
 
-    def _resolve_font(self, original_font_name: str) -> tuple[str, str]:
-        """
-        Try to find an appropriate font name for insertion.
-        Returns (font_name_for_fitz, source_description).
-        """
-        lower = original_font_name.lower()
+    def _match_span_for_word(
+        self,
+        x0: float,
+        y0: float,
+        x1: float,
+        y1: float,
+        block_no: int,
+        line_no: int,
+        spans: list[TextElement],
+    ) -> Optional[TextElement]:
+        """Return the best matching span for a word based on overlap and locality."""
+        word_rect = fitz.Rect(x0, y0, x1, y1)
+        best_match = None
+        best_score = -1.0
 
-        # Check if bold/italic flags can be inferred from font name
-        is_bold   = "bold"   in lower or "heavy" in lower or "black" in lower
+        for span in spans:
+            if span.block_no != block_no or span.line_no != line_no:
+                continue
+            span_rect = fitz.Rect(span.x0, span.y0, span.x1, span.y1)
+            inter = word_rect & span_rect
+            if inter.is_empty:
+                continue
+            overlap_area = inter.get_area()
+            word_area = max(word_rect.get_area(), 1.0)
+            score = overlap_area / word_area
+            if score > best_score:
+                best_score = score
+                best_match = span
+
+        if best_match:
+            return best_match
+
+        for span in spans:
+            span_rect = fitz.Rect(span.x0, span.y0, span.x1, span.y1)
+            inter = word_rect & span_rect
+            if inter.is_empty:
+                continue
+            overlap_area = inter.get_area()
+            word_area = max(word_rect.get_area(), 1.0)
+            score = overlap_area / word_area
+            if score > best_score:
+                best_score = score
+                best_match = span
+
+        return best_match
+
+    def _resolve_font(self, original_font_name: str) -> tuple[str, str]:
+        """Map the original font name to a supported insertion font."""
+        lower = original_font_name.lower()
+        is_bold = "bold" in lower or "heavy" in lower or "black" in lower
         is_italic = "italic" in lower or "oblique" in lower
 
-        # Walk fallback table
         for fragment, base in self.FONT_FALLBACKS.items():
             if fragment in lower:
                 if is_bold and is_italic:
-                    mapped = base + "-BoldOblique" if "Times" in base else base + "-BoldOblique"
+                    mapped = base.replace("Roman", "BoldItalic") if "Roman" in base else base + "-BoldOblique"
                 elif is_bold:
                     mapped = base.replace("Roman", "Bold") if "Roman" in base else base + "-Bold"
                 elif is_italic:
@@ -311,7 +405,6 @@ class PDFEditor:
                     mapped = base
                 return mapped, f"fallback (matched '{fragment}')"
 
-        # Default: Helvetica family
         if is_bold and is_italic:
             return "Helvetica-BoldOblique", "default fallback"
         if is_bold:
@@ -328,49 +421,37 @@ class PDFEditor:
         max_width: float,
         max_height: float,
     ) -> float:
-        """
-        Reduce font size iteratively until `text` fits within the bounding box.
-        Minimum font size is 4pt.
-        """
-        size = original_size
+        """Reduce font size iteratively until the text fits inside the target box."""
+        size = min(original_size, max(max_height * 0.95, 4.0))
         try:
-            temp_doc = fitz.open()
-            temp_page = temp_doc.new_page(width=max_width * 10, height=max_height * 10)
-            while size >= 4:
-                # Measure text width at current size
-                tw = fitz.get_text_length(text, fontname=font_name, fontsize=size)
-                if tw <= max_width:
+            while size >= 4.0:
+                text_width = fitz.get_text_length(text, fontname=font_name, fontsize=size)
+                if text_width <= max_width:
                     break
                 size -= 0.5
-            temp_doc.close()
         except Exception:
             pass
         return max(size, 4.0)
 
 
 # ------------------------------------------------------------------ #
-#  Module-level helpers
+# Module-level helpers
 # ------------------------------------------------------------------ #
 
 def _int_to_rgb(color_int: int) -> tuple:
     """Convert PyMuPDF packed integer color to (r, g, b) floats in [0, 1]."""
     r = ((color_int >> 16) & 0xFF) / 255.0
-    g = ((color_int >> 8)  & 0xFF) / 255.0
-    b = (color_int         & 0xFF) / 255.0
+    g = ((color_int >> 8) & 0xFF) / 255.0
+    b = (color_int & 0xFF) / 255.0
     return (r, g, b)
 
 
 def _detect_background(page: fitz.Page, rect: fitz.Rect) -> tuple:
-    """
-    Sample a small area around the text bbox to guess background color.
-    Falls back to white (1, 1, 1) if detection fails.
-    """
+    """Guess background color around a text rectangle; default to white."""
     try:
-        # Render a tiny portion of the page around the rect
         clip = fitz.Rect(rect.x0 - 2, rect.y0 - 2, rect.x1 + 2, rect.y1 + 2)
         pix = page.get_pixmap(clip=clip, alpha=False)
-        # Sample top-left corner pixel
-        sample = pix.pixel(0, 0)  # returns (r, g, b)
+        sample = pix.pixel(0, 0)
         return tuple(c / 255.0 for c in sample[:3])
     except Exception:
         return (1.0, 1.0, 1.0)
